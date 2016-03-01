@@ -7,6 +7,7 @@ from numpy import dot, exp
 from numpy.linalg import solve, norm, inv
 from scipy.integrate import trapz
 import scipy.stats as stats
+from scipy import interpolate
 
 from lifelines.fitters import BaseFitter
 from lifelines.utils import survival_table_from_events, inv_normal_cdf, normalize,\
@@ -111,7 +112,7 @@ class CoxPHFitter(BaseFitter):
                 # Only censored with current time, move on
                 continue
 
-            # There was atleast one event and no more ties remain. Time to sum.
+            # There was at least one event and no more ties remain. Time to sum.
             partial_gradient = np.zeros((1, d))
 
             for l in range(tie_count):
@@ -427,6 +428,39 @@ class CoxPHFitter(BaseFitter):
 
         return pd.DataFrame(exp(np.dot(X, self.hazards_.T)), index=index)
 
+    def predict_partial_hazard_ci(self, X):
+        """
+        X: a (n,d) covariate numpy array or DataFrame. If a DataFrame, columns
+                can be in any order. If a numpy array, columns must be in the
+                same order as the training data.
+        If covariates were normalized during fitting, they are normalized
+        in the same way here.
+        If X is a dataframe, the order of the columns do not matter. But
+            if X is an array, then the column ordering is assumed to be the
+            same as the training dataset.
+            Returns the partial hazard for the individuals, partial since the
+            baseline hazard is not included. Equal to \exp{\beta X}
+        """
+
+        index = _get_index(X)
+
+        if isinstance(X, pd.DataFrame):
+            order = self.hazards_.columns
+            X = X[order]
+
+        if self.normalize:
+            # Assuming correct ordering and number of columns
+            X = normalize(X, self._norm_mean.values, self._norm_std.values)
+
+        df = pd.DataFrame(exp(np.dot(X, self.confidence_intervals_.T)), index=index)
+
+        #df.rename(columns={0: 'lowerbound', 1: 'upperbound'}, inplace=True)
+        # must sort these because lower and upper are sometimes switched (don't know why)
+        df['lowerbound']=df.min(axis=1)
+        df['upperbound']=df.max(axis=1)
+
+        return df[['lowerbound','upperbound']]
+
     def predict_log_hazard_relative_to_mean(self, X):
         """
         X: a (n,d) covariate numpy array or DataFrame. If a DataFrame, columns
@@ -517,3 +551,99 @@ class CoxPHFitter(BaseFitter):
             baseline_hazard_.ix[t] = v
 
         return baseline_hazard_
+
+    def identify_forecast_timepoints(self, X, time_range):
+        """
+        :param X: a (n,d) covariate numpy array or DataFrame. If a numpy array, it is coerced into a DataFrame
+        :param time_range: a list of times to calculate the survival for.
+        :return: time_point_df a DataFrame of selected future times to create survival forecasts for.
+
+        Construct a data frame that has the current time_col for each observation incremented by the values in the
+        desired list (time_range)
+        """
+        time_col = self.durations.name
+        column_names = ['time_point_'+np.str(tp) for tp in time_range]
+
+        if isinstance(X, pd.DataFrame):
+            my_index = X.index.tolist()
+        else:
+            my_index = np.arange(0, len(X))
+            X = pd.DataFrame(X, columns=self.hazards_.columns)
+
+        time_point_df = pd.DataFrame(columns=column_names, index=my_index)
+        for idx in my_index:
+            my_times = np.array([X.loc[idx, time_col]+tp for tp in time_range])
+            time_point_df.ix[idx] = my_times
+
+        return time_point_df
+
+    def _return_desired_cumulative_hazards(self, t):
+        """
+        t: an event time that is used as the base line to forecast forward in time
+        """
+        maxtimepoint = self.baseline_hazard_.index.max() #Now taken care of in the forecast
+        if t > maxtimepoint:
+            t = maxtimepoint # just set to the max value.
+        try:
+            # spec_hazard = self.baseline_hazard_.ix[t].values
+            c_haz = self.baseline_cumulative_hazard_.ix[t].values[0]
+
+        except KeyError:
+            # get the first after this point
+            t_post = self.baseline_hazard_.ix[t:].index[0]
+            # get the last before this point
+            t_prior = self.baseline_hazard_.ix[:t].index[-1]
+            # x = [t_prior, t_post]
+            y = [self.baseline_cumulative_hazard_.ix[t_prior].values[0],
+                 self.baseline_cumulative_hazard_.ix[t_post].values[0]]
+            # print(x, y)
+            chaz_interp = interpolate.interp1d([t_prior, t_post], y)
+            c_haz = chaz_interp(t)
+
+        return c_haz
+
+    def forecast_survival_function(self, df, time_range=[0,1,2], calc_ci=True):
+        """
+        :param self:
+        :param df:
+
+        :param time_range:
+        :param calc_ci: flag to return the coinfidence intervals
+        :return:
+        """
+
+        #time_col = self.durations.name
+        col_names = ['t_'+np.str(tp) for tp in time_range]
+        # calculate the predicted hazard
+        my_partial_hazard = self.predict_partial_hazard(df)
+        # assign the specific timepoints and calculate the cumulative hazards at these points
+        forecast_times = self.identify_forecast_timepoints(df, time_range)
+        # replace those that exceed the max-time observed with the max observed time
+        max_time = self.baseline_hazard_.index.max()
+        forecast_times[forecast_times > max_time] = max_time
+        specific_cumulative_hazards = forecast_times.applymap(lambda x: self._return_desired_cumulative_hazards(x))
+        # predict the survival function at these forecasted times
+
+        pred_survival_fcn = pd.DataFrame(exp(-np.multiply(specific_cumulative_hazards.values,
+                                                             my_partial_hazard.values)), index=df.index)
+
+        if calc_ci:
+            # calculate the predicted hazard
+            partial_hazard_ci = self.predict_partial_hazard_ci(df)
+            pred_lower_survival_ci = pd.DataFrame(exp(-np.multiply(specific_cumulative_hazards.values.T,
+                                                                      partial_hazard_ci.values[:, 1])),
+                                                  columns=df.index).T
+            pred_upper_survival_ci = pd.DataFrame(exp(-np.multiply(specific_cumulative_hazards.values.T,
+                                                                      partial_hazard_ci.values[:, 0])),
+                                                  columns=df.index).T
+
+            surv_prediction = pd.Panel(data={'surv': pred_survival_fcn, 'lbci': pred_lower_survival_ci,
+                                             'ubci': pred_upper_survival_ci})
+        else:
+            surv_prediction = pd.Panel(data={'surv': pred_survival_fcn})
+                                       #, 'lbci': pred_survival_fcn,
+                                       #      'ubci': pred_survival_fcn})
+        surv_prediction.minor_axis = col_names
+        
+        return surv_prediction
+
