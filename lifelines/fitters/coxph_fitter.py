@@ -8,6 +8,7 @@ from numpy.linalg import solve, norm, inv
 from scipy.integrate import trapz
 import scipy.stats as stats
 from scipy import interpolate
+from scipy.optimize import curve_fit
 
 from lifelines.fitters import BaseFitter
 from lifelines.utils import survival_table_from_events, inv_normal_cdf, normalize,\
@@ -602,13 +603,13 @@ class CoxPHFitter(BaseFitter):
 
         return c_haz
 
-    def forecast_survival_function(self, df, time_range=[0,1,2], calc_ci=True):
+    def forecast_survival_function(self, df, time_range=[0,1,2], calc_ci=True, extrapolate=False):
         """
         :param self:
         :param df:
 
         :param time_range:
-        :param calc_ci: flag to return the coinfidence intervals
+        :param calc_ci: flag to return the confidence intervals
         :return:
         """
 
@@ -618,12 +619,23 @@ class CoxPHFitter(BaseFitter):
         my_partial_hazard = self.predict_partial_hazard(df)
         # assign the specific timepoints and calculate the cumulative hazards at these points
         forecast_times = self.identify_forecast_timepoints(df, time_range)
-        # replace those that exceed the max-time observed with the max observed time
         max_time = self.baseline_hazard_.index.max()
-        forecast_times[forecast_times > max_time] = max_time
-        specific_cumulative_hazards = forecast_times.applymap(lambda x: self._return_desired_cumulative_hazards(x))
-        # predict the survival function at these forecasted times
+        if extrapolate:
+            # do a linear extrapolation of the cumulative hazards and use this to get values beyond the known range
+            p_haz, p_haz_cov = curve_fit(line, self.baseline_cumulative_hazard_.index,
+                                 self.baseline_cumulative_hazard_.values.ravel())
+            # force the points to match
+            offset = self.baseline_cumulative_hazard_.values[-1][0] - line(self.baseline_cumulative_hazard_.index[-1],
+                                                                           p_haz[0] ,p_haz[1])
+            # apply to timepoints
+            specific_cumulative_hazards = forecast_times.applymap(lambda x: self._return_desired_cumulative_hazards(x)
+            if x <= max_time else offset+line(x,popt[0],popt[1]))
+        else:  # this is the default case
+            # replace those that exceed the max-time observed with the max observed time
+            forecast_times[forecast_times > max_time] = max_time
+            specific_cumulative_hazards = forecast_times.applymap(lambda x: self._return_desired_cumulative_hazards(x))
 
+        # predict the survival function at these forecasted times
         pred_survival_fcn = pd.DataFrame(exp(-np.multiply(specific_cumulative_hazards.values,
                                                              my_partial_hazard.values)), index=df.index)
 
@@ -644,6 +656,12 @@ class CoxPHFitter(BaseFitter):
                                        #, 'lbci': pred_survival_fcn,
                                        #      'ubci': pred_survival_fcn})
         surv_prediction.minor_axis = col_names
-        
+
         return surv_prediction
+
+
+def line(x, a, b):
+    return a*x+b
+
+
 
